@@ -7,6 +7,7 @@ from collections import defaultdict
 from . import mask as maskUtils
 import copy
 
+
 class COCOeval:
     # Interface for evaluating detection on the Microsoft COCO dataset.
     #
@@ -32,7 +33,7 @@ class COCOeval:
     # Note: if useCats=0 category labels are ignored as in proposal scoring.
     # Note: multiple areaRngs [Ax2] and maxDets [Mx1] can be specified.
     #
-    # evaluate(): evaluates detections on every image and every category and
+    # evaluate(): evaluates detections per image per category N, K
     # concats the results into the "evalImgs" with fields:
     #  dtIds      - [1xD] id for each of the D detections (dt)
     #  gtIds      - [1xG] id for each of the G ground truths (gt)
@@ -69,18 +70,24 @@ class COCOeval:
         self.cocoGt   = cocoGt              # ground truth COCO API
         self.cocoDt   = cocoDt              # detections COCO API
         self.params   = {}                  # evaluation parameters
-        self.evalImgs = defaultdict(list)   # per-image per-category evaluation results [KxAxI] elements
+        self.evalImgs = []
+        # [KxAxN] elements of dict eval results. In one giant single-dim list
         self.eval     = {}                  # accumulated evaluation results
-        self._gts = defaultdict(list)       # gt for evaluation
-        self._dts = defaultdict(list)       # dt for evaluation
+        self._gts = defaultdict(list)       # gt anns for evaluation
+        # HC: dict of (img_id, cat_id): [anns]
+        self._dts = defaultdict(list)       # dt anns for evaluation
+        # HC: dict of (img_id, cat_id): [anns]
         self.params = Params(iouType=iouType) # parameters
         self._paramsEval = {}               # parameters for evaluation
         self.stats = []                     # result summarization
         self.ious = {}                      # ious between all gts and dts
-        if not cocoGt is None:
+        # HC: dict of (img_id, cat_id): [num_dt x num_gt]
+        if cocoGt is not None:
             self.params.imgIds = sorted(cocoGt.getImgIds())
             self.params.catIds = sorted(cocoGt.getCatIds())
 
+        # HC:
+        self.evalImgsDict = dict()
 
     def _prepare(self):
         '''
@@ -106,6 +113,8 @@ class COCOeval:
             _toMask(dts, self.cocoDt)
         # set ignore flag
         for gt in gts:
+            # assert 'ignore' not in gt  # validate that there is no impact
+            assert 'iscrowd' in gt
             gt['ignore'] = gt['ignore'] if 'ignore' in gt else 0
             gt['ignore'] = 'iscrowd' in gt and gt['iscrowd']
             if p.iouType == 'keypoints':
@@ -116,7 +125,7 @@ class COCOeval:
             self._gts[gt['image_id'], gt['category_id']].append(gt)
         for dt in dts:
             self._dts[dt['image_id'], dt['category_id']].append(dt)
-        self.evalImgs = defaultdict(list)   # per-image per-category evaluation results
+        self.evalImgs = []                  # per-image per-category evaluation results
         self.eval     = {}                  # accumulated evaluation results
 
     def evaluate(self):
@@ -128,7 +137,7 @@ class COCOeval:
         print('Running per image evaluation...')
         p = self.params
         # add backward compatibility if useSegm is specified in params
-        if not p.useSegm is None:
+        if p.useSegm is not None:
             p.iouType = 'segm' if p.useSegm == 1 else 'bbox'
             print('useSegm (deprecated) is not None. Running {} evaluation'.format(p.iouType))
         print('Evaluate annotation type *{}*'.format(p.iouType))
@@ -136,7 +145,7 @@ class COCOeval:
         if p.useCats:
             p.catIds = list(np.unique(p.catIds))
         p.maxDets = sorted(p.maxDets)
-        self.params=p
+        self.params = p
 
         self._prepare()
         # loop through images, area range, max detection number
@@ -146,35 +155,37 @@ class COCOeval:
             computeIoU = self.computeIoU
         elif p.iouType == 'keypoints':
             computeIoU = self.computeOks
-        self.ious = {(imgId, catId): computeIoU(imgId, catId) \
-                        for imgId in p.imgIds
-                        for catId in catIds}
+        # dim [d x g]
+        self.ious = {(imgId, catId): computeIoU(imgId, catId)
+                     for imgId in p.imgIds
+                     for catId in catIds}
 
         evaluateImg = self.evaluateImg
         maxDet = p.maxDets[-1]
-        self.evalImgs = [evaluateImg(imgId, catId, areaRng, maxDet)
-                 for catId in catIds
-                 for areaRng in p.areaRng
-                 for imgId in p.imgIds
-             ]
+        self.evalImgs = [
+            evaluateImg(imgId, catId, areaRng, maxDet)
+            for catId in catIds
+            for areaRng in p.areaRng
+            for imgId in p.imgIds
+        ]
         self._paramsEval = copy.deepcopy(self.params)
         toc = time.time()
-        print('DONE (t={:0.2f}s).'.format(toc-tic))
+        print('DONE (t={:0.2f}s).'.format(toc - tic))
 
     def computeIoU(self, imgId, catId):
         p = self.params
         if p.useCats:
-            gt = self._gts[imgId,catId]
-            dt = self._dts[imgId,catId]
+            gt = self._gts[imgId, catId]
+            dt = self._dts[imgId, catId]
         else:
-            gt = [_ for cId in p.catIds for _ in self._gts[imgId,cId]]
-            dt = [_ for cId in p.catIds for _ in self._dts[imgId,cId]]
-        if len(gt) == 0 and len(dt) ==0:
+            gt = [_ for cId in p.catIds for _ in self._gts[imgId, cId]]
+            dt = [_ for cId in p.catIds for _ in self._dts[imgId, cId]]
+        if len(gt) == 0 and len(dt) == 0:
             return []
         inds = np.argsort([-d['score'] for d in dt], kind='mergesort')
         dt = [dt[i] for i in inds]
         if len(dt) > p.maxDets[-1]:
-            dt=dt[0:p.maxDets[-1]]
+            dt = dt[0:p.maxDets[-1]]
 
         if p.iouType == 'segm':
             g = [g['segmentation'] for g in gt]
@@ -187,7 +198,9 @@ class COCOeval:
 
         # compute iou between each dt and gt region
         iscrowd = [int(o['iscrowd']) for o in gt]
-        ious = maskUtils.iou(d,g,iscrowd)
+        ious = maskUtils.iou(d, g, iscrowd)
+        if not isinstance(ious, list):
+            assert (ious >= 0).all(), print(ious)
         return ious
 
     def computeOks(self, imgId, catId):
@@ -240,80 +253,93 @@ class COCOeval:
         '''
         p = self.params
         if p.useCats:
-            gt = self._gts[imgId,catId]
-            dt = self._dts[imgId,catId]
+            gt = self._gts[imgId, catId]
+            dt = self._dts[imgId, catId]
         else:
-            gt = [_ for cId in p.catIds for _ in self._gts[imgId,cId]]
-            dt = [_ for cId in p.catIds for _ in self._dts[imgId,cId]]
-        if len(gt) == 0 and len(dt) ==0:
+            gt = [_ for cId in p.catIds for _ in self._gts[imgId, cId]]
+            dt = [_ for cId in p.catIds for _ in self._dts[imgId, cId]]
+        aRngInd = p.areaRng.index(aRng)
+
+        if len(gt) == 0 and len(dt) == 0:
+            self.evalImgsDict[(imgId, catId, aRngInd)] = None
             return None
 
         for g in gt:
-            if g['ignore'] or (g['area']<aRng[0] or g['area']>aRng[1]):
+            if g['ignore'] or (g['area'] < aRng[0] or g['area'] > aRng[1]):
                 g['_ignore'] = 1
             else:
                 g['_ignore'] = 0
 
-        # sort dt highest score first, sort gt ignore last
-        gtind = np.argsort([g['_ignore'] for g in gt], kind='mergesort')
-        gt = [gt[i] for i in gtind]
+        non_ig_inds = (np.array([g['_ignore'] for g in gt]) == 0)
         dtind = np.argsort([-d['score'] for d in dt], kind='mergesort')
         dt = [dt[i] for i in dtind[0:maxDet]]
-        iscrowd = [int(o['iscrowd']) for o in gt]
-        # load computed ious
-        ious = self.ious[imgId, catId][:, gtind] if len(self.ious[imgId, catId]) > 0 else self.ious[imgId, catId]
+        crowdInds = np.where( np.array([int(o['iscrowd']) for o in gt]) == 1)[0]
+        # load computed ious. if len > 0, it is ndarray, else an empty list
+        ious = self.ious[imgId, catId] \
+                if len(self.ious[imgId, catId]) > 0 \
+                else np.empty(0)
 
         T = len(p.iouThrs)
         G = len(gt)
         D = len(dt)
-        gtm  = np.zeros((T,G))
-        dtm  = np.zeros((T,D))
-        gtIg = np.array([g['_ignore'] for g in gt])
-        dtIg = np.zeros((T,D))
-        if not len(ious)==0:
+        gtm  = np.zeros((T, G), dtype=np.int64)
+        dtm  = np.zeros((T, D), dtype=np.int64)
+        gtIg = np.array([g['_ignore'] for g in gt], dtype=np.int8)
+        dtIg = np.zeros((T, D), dtype=np.int8)  # why Ig at different thresholds?
+        ious_backup = ious.copy()
+        if not ious.size == 0:
             for tind, t in enumerate(p.iouThrs):
+                ious = ious_backup.copy()
                 for dind, d in enumerate(dt):
-                    # information about best match so far (m=-1 -> unmatched)
-                    iou = min([t,1-1e-10])
-                    m   = -1
-                    for gind, g in enumerate(gt):
-                        # if this gt already matched, and not a crowd, continue
-                        if gtm[tind,gind]>0 and not iscrowd[gind]:
-                            continue
-                        # if dt matched to reg gt, and on ignore gt, stop
-                        if m>-1 and gtIg[m]==0 and gtIg[gind]==1:
-                            break
-                        # continue to next gt unless better match made
-                        if ious[dind,gind] < iou:
-                            continue
-                        # if match successful and best so far, store appropriately
-                        iou=ious[dind,gind]
-                        m=gind
-                    # if match made store id of match for both dt and gt
-                    if m ==-1:
+                    valid_iou = ious[dind, non_ig_inds]
+                    ig_iou = ious[dind, ~non_ig_inds]
+                    # max cannot be applied on size zero tsr
+                    if len(valid_iou) > 0 and np.max(valid_iou) > t:
+                        # there is a non-ignore match, then use this match
+                        matched_gt_ind = np.arange(G)[non_ig_inds][np.argmax(valid_iou)]
+                        ious[:, matched_gt_ind] = -1
+                    elif len(ig_iou) > 0 and np.max(ig_iou) > t:
+                        # forgive when no valid match, but onto an ignored one
+                        dtIg[tind, dind] = 1
+                        matched_gt_ind = np.arange(G)[~non_ig_inds][np.argmax(ig_iou)]
+                        if matched_gt_ind in crowdInds:
+                            pass  # crowd gt can be repeatedly used. don't set to -1
+                        else:  # ignored due to area filter
+                            ious[:, matched_gt_ind] = -1
+                    else:
                         continue
-                    dtIg[tind,dind] = gtIg[m]
-                    dtm[tind,dind]  = gt[m]['id']
-                    gtm[tind,m]     = d['id']
+                    # shared code path for first two cases
+                    dtm[tind, dind] = gt[matched_gt_ind]['id']
+                    gtm[tind, matched_gt_ind] = d['id']
         # set unmatched detections outside of area range to ignore
-        a = np.array([d['area']<aRng[0] or d['area']>aRng[1] for d in dt]).reshape((1, len(dt)))
-        dtIg = np.logical_or(dtIg, np.logical_and(dtm==0, np.repeat(a,T,0)))
-        # store results for given image and category
-        return {
-                'image_id':     imgId,
-                'category_id':  catId,
-                'aRng':         aRng,
-                'maxDet':       maxDet,
-                'dtIds':        [d['id'] for d in dt],
-                'gtIds':        [g['id'] for g in gt],
-                'dtMatches':    dtm,
-                'gtMatches':    gtm,
-                'dtScores':     [d['score'] for d in dt],
-                'gtIgnore':     gtIg,
-                'dtIgnore':     dtIg,
-            }
+        a = np.array([
+            d['area'] < aRng[0] or d['area'] > aRng[1]
+            for d in dt
+        ]).reshape((1, len(dt)))
+        dtIg = np.logical_or(
+            dtIg,  # those whose matched gt is ignored OR
+            np.logical_and(dtm == 0,  # those not matched
+                           np.repeat(a, T, 0))  # and are outside area range
+        )
 
-    def accumulate(self, p = None):
+        self.evalImgsDict[ (imgId, catId, aRngInd) ] = {
+            'image_id':     imgId,
+            'category_id':  catId,
+            'aRng':         aRng,
+            'maxDet':       maxDet,
+            'dtIds':        np.array([d['id'] for d in dt], dtype=np.int64),
+            'gtIds':        np.array([g['id'] for g in gt], dtype=np.int64),
+            'dtMatches':    dtm,
+            'gtMatches':    gtm,
+            'dtScores':     np.array([d['score'] for d in dt], dtype=np.float64),
+            'gtIgnore':     gtIg,
+            'dtIgnore':     dtIg,
+        }
+        # store results for given image and category
+        return self.evalImgsDict[(imgId, catId, aRngInd)]
+
+
+    def accumulate(self, p=None):
         '''
         Accumulate per image evaluation results and store the result in self.eval
         :param p: input params for evaluation
@@ -344,20 +370,22 @@ class COCOeval:
         setM = set(_pe.maxDets)
         setI = set(_pe.imgIds)
         # get inds to evaluate
-        k_list = [n for n, k in enumerate(p.catIds)  if k in setK]
+        k_list = [n for n, k in enumerate(p.catIds)  if k in setK]  # HC: use contiguous n
         m_list = [m for n, m in enumerate(p.maxDets) if m in setM]
         a_list = [n for n, a in enumerate(map(lambda x: tuple(x), p.areaRng)) if a in setA]
         i_list = [n for n, i in enumerate(p.imgIds)  if i in setI]
-        I0 = len(_pe.imgIds)
+        I0 = len(_pe.imgIds)  # used to compute strides into KxAxN evalImgs
         A0 = len(_pe.areaRng)
         # retrieve E at each category, area range, and max number of detections
+        # evalImgs is a giant list, not ndarray because each elem is a dict.
+        # Hence it can only be accessed through stride indexing. How Unfortunate
         for k, k0 in enumerate(k_list):
-            Nk = k0*A0*I0
+            Nk = k0 * A0 * I0
             for a, a0 in enumerate(a_list):
-                Na = a0*I0
+                Na = a0 * I0
                 for m, maxDet in enumerate(m_list):
                     E = [self.evalImgs[Nk + Na + i] for i in i_list]
-                    E = [e for e in E if not e is None]
+                    E = [e for e in E if e is not None]
                     if len(E) == 0:
                         continue
                     dtScores = np.concatenate([e['dtScores'][0:maxDet] for e in E])
@@ -370,9 +398,10 @@ class COCOeval:
                     dtm  = np.concatenate([e['dtMatches'][:,0:maxDet] for e in E], axis=1)[:,inds]
                     dtIg = np.concatenate([e['dtIgnore'][:,0:maxDet]  for e in E], axis=1)[:,inds]
                     gtIg = np.concatenate([e['gtIgnore'] for e in E])
-                    npig = np.count_nonzero(gtIg==0 )
+                    npig = np.count_nonzero(gtIg == 0)
                     if npig == 0:
                         continue
+                    # true positives and false positives
                     tps = np.logical_and(               dtm,  np.logical_not(dtIg) )
                     fps = np.logical_and(np.logical_not(dtm), np.logical_not(dtIg) )
 
@@ -383,9 +412,9 @@ class COCOeval:
                         fp = np.array(fp)
                         nd = len(tp)
                         rc = tp / npig
-                        pr = tp / (fp+tp+np.spacing(1))
-                        q  = np.zeros((R,))
-                        ss = np.zeros((R,))
+                        pr = tp / (fp + tp + np.spacing(1))  # np spacing is a tiny epsilon
+                        q  = np.zeros((R,))  # store prec at recThr lvls
+                        ss = np.zeros((R,))  # sorted scores at correponding lvls
 
                         if nd:
                             recall[t,k,a,m] = rc[-1]
@@ -396,14 +425,14 @@ class COCOeval:
                         # use python array gets significant speed improvement
                         pr = pr.tolist(); q = q.tolist()
 
-                        for i in range(nd-1, 0, -1):
-                            if pr[i] > pr[i-1]:
-                                pr[i-1] = pr[i]
-
+                        for i in range(nd - 1, 0, -1):
+                            if pr[i] > pr[i - 1]:
+                                pr[i - 1] = pr[i]
+                        # the index of precision array at which the recall is reached
                         inds = np.searchsorted(rc, p.recThrs, side='left')
                         try:
                             for ri, pi in enumerate(inds):
-                                q[ri] = pr[pi]
+                                q[ri] = pr[pi]  # recall index, precision index
                                 ss[ri] = dtScoresSorted[pi]
                         except:
                             pass
