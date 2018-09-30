@@ -1,8 +1,18 @@
+*.pyc
+*~
+*.o
+*.so
+build/
+*.egg-info/
+*.egg
+__pycache__/
+
 images/
 annotations/
 results/
 external/
 .DS_Store
+
 
 MatlabAPI/analyze*/
 MatlabAPI/visualize*/
